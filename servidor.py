@@ -177,7 +177,7 @@ class ServidorGUI:
         title_frame.grid(row=0, column=0, sticky='ew', padx=10, pady=(10, 5))
         
         self.titulo_label = tk.Label(
-            title_frame, text=f"🖥️ SERVIDOR {self.rol.upper()}",
+            title_frame, text=f"SERVIDOR {self.rol.upper()}",
             font=('Arial', 16, 'bold'), bg='#1e1e2e', fg='#89b4fa'
         )
         self.titulo_label.pack()

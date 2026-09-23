@@ -77,7 +77,7 @@ class ClienteGUI:
         actions_frame.grid(row=2, column=0, sticky='ew', pady=(0, 8))
         
         tk.Label(
-            actions_frame, text="📤 ENVÍO DE ARCHIVOS",
+            actions_frame, text="ENVÍO DE ARCHIVOS",
             font=('Arial', 10, 'bold'), bg='#313244', fg='#cdd6f4', pady=5
         ).pack()
         
