@@ -1,6 +1,8 @@
 # balanceador.py
 import configparser
 import os
+import socket
+import threading
 
 
 class Balanceador:
@@ -8,10 +10,10 @@ class Balanceador:
         self.cargar_configuracion()
         self.servidores = self.inicializar_servidores()
         self.indice_round_robin = 0
+        self.lock = threading.Lock()  # protege servidores + indice_round_robin
 
     def cargar_configuracion(self):
         config = configparser.ConfigParser()
-        # Valores por defecto, por si el .ini no existe o falta la sección
         self.config_servidores_iniciales = "127.0.0.1:5000,127.0.0.1:5002"
         self.config_max_clientes = 3
         self.config_puerto_balanceador = 6000
@@ -30,7 +32,6 @@ class Balanceador:
                     'puerto_base_dinamico', self.config_puerto_base_dinamico))
 
     def inicializar_servidores(self):
-        """Convierte 'host:puerto,host:puerto' en una lista de diccionarios."""
         servidores = []
         for entrada in self.config_servidores_iniciales.split(','):
             host, puerto = entrada.strip().split(':')
@@ -42,25 +43,24 @@ class Balanceador:
         return servidores
 
     def asignar_servidor(self):
-        """Busca un servidor con espacio disponible en orden round-robin.
-        Si todos están llenos, crea uno nuevo."""
-        total = len(self.servidores)
-        for i in range(total):
-            indice = (self.indice_round_robin + i) % total
-            servidor = self.servidores[indice]
-            if servidor["clientes_actuales"] < self.config_max_clientes:
-                servidor["clientes_actuales"] += 1
-                self.indice_round_robin = (indice + 1) % total
-                return servidor
+        """Thread-safe: busca servidor con espacio o crea uno nuevo."""
+        with self.lock:
+            total = len(self.servidores)
+            for i in range(total):
+                indice = (self.indice_round_robin + i) % total
+                servidor = self.servidores[indice]
+                if servidor["clientes_actuales"] < self.config_max_clientes:
+                    servidor["clientes_actuales"] += 1
+                    self.indice_round_robin = (indice + 1) % total
+                    return servidor
 
-        # Ningún servidor tiene espacio -> crear uno nuevo
-        nuevo = self.crear_servidor_dinamico()
-        nuevo["clientes_actuales"] += 1
-        self.indice_round_robin = (self.servidores.index(nuevo) + 1) % len(self.servidores)
-        return nuevo
+            nuevo = self.crear_servidor_dinamico()
+            nuevo["clientes_actuales"] += 1
+            self.indice_round_robin = (self.servidores.index(nuevo) + 1) % len(self.servidores)
+            return nuevo
 
     def crear_servidor_dinamico(self):
-        """Agrega un nuevo servidor a la lista con un puerto del rango dinámico."""
+        """Se llama SIEMPRE dentro de self.lock ya adquirido (ver asignar_servidor)."""
         cantidad_dinamicos = sum(
             1 for s in self.servidores if s["puerto"] >= self.config_puerto_base_dinamico
         )
@@ -81,15 +81,36 @@ class Balanceador:
         for s in self.servidores:
             print(f"  - {s['host']}:{s['puerto']} | clientes: {s['clientes_actuales']}")
 
+    # ==================== RED ====================
+    def iniciar(self):
+        """Abre el socket del balanceador y empieza a aceptar clientes."""
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind(("0.0.0.0", self.config_puerto_balanceador))
+        server_socket.listen(10)
+
+        print(f"[BALANCEADOR] Escuchando en puerto {self.config_puerto_balanceador}...")
+        self.mostrar_estado()
+
+        while True:
+            conn, addr = server_socket.accept()
+            threading.Thread(
+                target=self.atender_cliente, args=(conn, addr), daemon=True
+            ).start()
+
+    def atender_cliente(self, conn, addr):
+        """Responde con host:puerto del servidor asignado y cierra la conexión."""
+        try:
+            servidor = self.asignar_servidor()
+            respuesta = f"{servidor['host']}:{servidor['puerto']}\n"
+            conn.sendall(respuesta.encode('utf-8'))
+            print(f"[BALANCEADOR] Cliente {addr} -> asignado a {servidor['host']}:{servidor['puerto']}")
+        except Exception as e:
+            print(f"[BALANCEADOR] Error atendiendo a {addr}: {e}")
+        finally:
+            conn.close()
+
 
 if __name__ == "__main__":
     b = Balanceador()
-    b.mostrar_estado()
-
-    print("\n--- Simulando 8 clientes conectándose ---")
-    for i in range(1, 9):
-        asignado = b.asignar_servidor()
-        print(f"Cliente {i} -> {asignado['host']}:{asignado['puerto']}")
-
-    print("\n--- Estado final ---")
-    b.mostrar_estado()
+    b.iniciar()
