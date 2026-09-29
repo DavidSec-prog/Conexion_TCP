@@ -161,6 +161,8 @@ class ClienteGUI:
         self.config_timeout_transferencia = 30
         self.config_tamano_maximo = 2
         self.config_intervalo_ping = 3
+        self.config_host_balanceador = '127.0.0.1'
+        self.config_puerto_balanceador = 6000
         
         try:
             if os.path.exists('config.ini'):
@@ -174,6 +176,8 @@ class ClienteGUI:
                     self.config_timeout_transferencia = int(config['CLIENTE'].get('timeout_transferencia', 30))
                     self.config_tamano_maximo = int(config['CLIENTE'].get('tamano_maximo_mb', 2))
                     self.config_intervalo_ping = int(config['CLIENTE'].get('intervalo_ping', 3))
+                    self.config_host_balanceador = config['CLIENTE'].get('host_balanceador', '127.0.0.1')
+                    self.config_puerto_balanceador = int(config['CLIENTE'].get('puerto_balanceador', 6000))
                 print("✓ Configuración cargada")
         except Exception as e:
             print(f"Error config: {e}")
@@ -207,11 +211,34 @@ class ClienteGUI:
             else:
                 time.sleep(1)
     
+    def consultar_balanceador(self):
+        """Se conecta al balanceador, recibe 'host:puerto\\n' y devuelve (host, puerto)."""
+        try:
+            sock_temp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock_temp.settimeout(self.config_timeout_conexion)
+            sock_temp.connect((self.config_host_balanceador, self.config_puerto_balanceador))
+            
+            respuesta = sock_temp.recv(1024).decode('utf-8').strip()
+            sock_temp.close()
+            
+            host, puerto = respuesta.split(':')
+            self.log(f"📡 Balanceador asignó: {host}:{puerto}", 'info')
+            return host, int(puerto)
+        except Exception as e:
+            self.log(f"[!] No se pudo contactar al balanceador: {e}", 'error')
+            return None, None
+    
     def intentar_conexion(self):
         try:
+            # 1. Preguntar al balanceador qué servidor me toca
+            servidor_host, servidor_puerto = self.consultar_balanceador()
+            if servidor_host is None:
+                return False
+            
+            # 2. Conectarse al servidor real asignado
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(self.config_timeout_conexion)
-            self.socket.connect((self.config_host, self.config_puerto))
+            self.socket.connect((servidor_host, servidor_puerto))
             
             nombre_len_bytes = self.recibir_exacto(2)
             if not nombre_len_bytes or len(nombre_len_bytes) < 2:
@@ -230,7 +257,7 @@ class ClienteGUI:
             self.root.after(0, lambda: self.nombre_label.config(
                 text=f"📁 {self.nombre_cliente}", fg='#a6e3a1'))
             
-            self.log(f"✓ Conectado como {self.nombre_cliente}", 'success')
+            self.log(f"✓ Conectado como {self.nombre_cliente} (servidor {servidor_host}:{servidor_puerto})", 'success')
             self.root.after(0, self.actualizar_estado_conectado)
             
             self.socket.settimeout(self.config_timeout_transferencia)
