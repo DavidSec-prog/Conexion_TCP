@@ -12,7 +12,7 @@ class Balanceador:
     def cargar_configuracion(self):
         config = configparser.ConfigParser()
         # Valores por defecto, por si el .ini no existe o falta la sección
-        self.config_servidores_iniciales = "127.0.0.1:5000,127.0.0.1:5001"
+        self.config_servidores_iniciales = "127.0.0.1:5000,127.0.0.1:5002"
         self.config_max_clientes = 3
         self.config_puerto_balanceador = 6000
 
@@ -38,6 +38,13 @@ class Balanceador:
             })
         return servidores
 
+    def asignar_servidor(self):
+        """Elige el siguiente servidor en orden circular (round-robin)."""
+        servidor = self.servidores[self.indice_round_robin]
+        servidor["clientes_actuales"] += 1
+        self.indice_round_robin = (self.indice_round_robin + 1) % len(self.servidores)
+        return servidor
+
     def mostrar_estado(self):
         print(f"Máximo de clientes por servidor: {self.config_max_clientes}")
         print(f"Puerto del balanceador: {self.config_puerto_balanceador}")
@@ -48,4 +55,12 @@ class Balanceador:
 
 if __name__ == "__main__":
     b = Balanceador()
+    b.mostrar_estado()
+
+    print("\n--- Simulando 5 clientes conectándose ---")
+    for i in range(1, 6):
+        asignado = b.asignar_servidor()
+        print(f"Cliente {i} -> {asignado['host']}:{asignado['puerto']}")
+
+    print("\n--- Estado final ---")
     b.mostrar_estado()
