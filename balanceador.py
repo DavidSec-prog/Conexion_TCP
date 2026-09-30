@@ -72,9 +72,6 @@ class Balanceador:
                     "manual": True,
                     "pendiente": False
                 })
-            else:
-                print(f"[BALANCEADOR] ✗ Servidor {host}:{puerto} NO responde (¿lo arrancaste?)")
-
     # ==================== LANZAMIENTO DE SERVIDORES DINÁMICOS ====================
     def lanzar_proceso_servidor(self, puerto):
         """Lanza servidor.py y espera a que el puerto esté realmente abierto."""

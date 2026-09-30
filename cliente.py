@@ -3,7 +3,7 @@ import threading #Hilos
 import os  # Rutas, archivos y directorios
 import time # Pausas e intervalos
 import re # Expresiones regulares para validar el formato "Cliente N"
-import configparser #Leer confi.ini
+import configparser #Leer config.ini
 import tkinter as tk #Inetrfaz Grafica y GUI
 from tkinter import filedialog, messagebox, scrolledtext, ttk #Submodulos de la GUI Caja de texto, scroll, mensajes etc
 from datetime import datetime #Hora en log
@@ -293,7 +293,7 @@ class ClienteGUI:
 
 
     def cargar_configuracion(self):
-        config = configparser.ConfigParser() #Utiliza la biblioteca para leer confi.ini
+        config = configparser.ConfigParser() #Utiliza la biblioteca para leer config.ini
         self.config_host = '127.0.0.1'  #En caso que no haya lee los valores definidos a continuacion
         self.config_puerto = 5000
         self.config_max_intentos = 3
