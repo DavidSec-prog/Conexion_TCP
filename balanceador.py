@@ -1,4 +1,3 @@
-# balanceador.py
 import configparser
 import os
 import re

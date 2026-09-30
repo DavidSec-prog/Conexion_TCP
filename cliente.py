@@ -4,7 +4,7 @@ import os  # Rutas, archivos y directorios
 import time # Pausas e intervalos
 import re # Expresiones regulares para validar el formato "Cliente N"
 import configparser #Leer config.ini
-import tkinter as tk #Inetrfaz Grafica y GUI
+import tkinter as tk #Inetrfaz Grafica  GUI
 from tkinter import filedialog, messagebox, scrolledtext, ttk #Submodulos de la GUI Caja de texto, scroll, mensajes etc
 from datetime import datetime #Hora en log
 

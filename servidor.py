@@ -633,7 +633,7 @@ class ServidorGUI:
 
                 # =========================================================================
                 # CASO A: El cliente envía un PING de control
-                # =========================================================================
+                # ========================================================================
                 if tipo == b'P':
                     try:
                         # Responde inmediatamente con un PONG para confirmar que sigue en línea
