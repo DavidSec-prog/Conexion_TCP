@@ -1,4 +1,4 @@
-# Sistema Distribuido de Transferencia de Archivos con Balanceador de Carga
+# Sistema Distribuido - Transferencia de Archivos con Balanceador de Carga
 
 Sistema cliente-servidor para distribución de archivos con balanceo de carga,
 tolerancia a fallos, escalamiento dinámico y programación de tareas mediante
