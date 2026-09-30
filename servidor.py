@@ -291,6 +291,9 @@ class ServidorGUI:
             self.config_puerto_backup = self.config_puerto + 1000
             print(f"[SERVIDOR] Modo POOL: escuchando en {self.config_puerto}")
 
+        self.config_relay_host = os.environ.get('SERVIDOR_RELAY_HOST', '127.0.0.1')
+        self.config_relay_puerto = int(os.environ.get('SERVIDOR_RELAY_PUERTO', 6001))
+
     # ==================== ARRANQUE ====================
     #Al arracnar el servidor muestra la pantall de inicio
     def arrancar(self):
@@ -381,24 +384,35 @@ class ServidorGUI:
             self.log(f"Rol primario detectado - Solicitando control al backup", 'role')
             threading.Thread(target=self.solicitar_control, daemon=True).start()
 
-    # ==================== SERVIDOR ACTIVO ====================
     def aceptar_clientes(self):
+        # CAMBIO: se guarda una referencia local al socket que este hilo debe vigilar.
+        # Esto evita que un hilo viejo intente usar un socket que ya fue cerrado/reemplazado
+        # cuando el servidor cambia de estado o vuelve a tomar el control.
+        socket_escucha = self.server_socket
+
+        if socket_escucha is None:
+            return
+
+        try:
+            socket_escucha.settimeout(1.0)
+        except OSError:
+            return
+
         while self.servidor_activo and self.es_activo:
-            #Va a validar que este activo y va aceptar los clientes para conectarse al servidor
             try:
-                if self.server_socket is None:
+                # CAMBIO: si este hilo ya no corresponde al socket actual, termina
+                # silenciosamente para no intentar aceptar sobre un socket cerrado.
+                if self.server_socket is not socket_escucha:
                     break
-                self.server_socket.settimeout(1.0)
+
                 try:
-                    client_socket, addr = self.server_socket.accept()
+                    client_socket, addr = socket_escucha.accept()
                 except socket.timeout:
                     continue
                 except OSError:
                     break
 
-                # ===== IDENTIFICAR SI ES CLIENTE REAL O HEALTH CHECK =====
-                # El cliente envía 'C' al conectar. El balanceador envía 'H' en sus pings.
-                # Si no recibimos 'C', no contamos la conexión como cliente.
+                # ===== LEER EL PRIMER BYTE PARA IDENTIFICAR EL TIPO =====
                 client_socket.settimeout(1.0)
                 try:
                     primer_byte = client_socket.recv(1)
@@ -406,26 +420,93 @@ class ServidorGUI:
                     primer_byte = b''
                 client_socket.settimeout(None)
 
-                if primer_byte != b'C':
-                    # No es un cliente real: es el health check del balanceador
-                    # o una conexión vacía. Cerrar sin asignar número.
+                # ===== CASO 1: HEALTH CHECK DEL BALANCEADOR (H) =====
+                if primer_byte == b'H':
                     try:
                         client_socket.close()
                     except:
                         pass
-                    continue  # Vuelve al inicio del while, sin contar
+                    continue
 
-                #Valdiacion y muestra de contador de clientes conectados
-                self.contador_clientes += 1
-                nombre_cliente = f"Cliente {self.contador_clientes}"
-                #Guarda el cliente conectado nombre Ip y el ultimo ping
+                # ===== CASO 2: QUERY DEL BALANCEADOR (Q) =====
+                # Responde con la cantidad REAL de clientes (4 bytes big-endian).
+                if primer_byte == b'Q':
+                    try:
+                        cantidad = len(self.clientes)
+                        client_socket.sendall(cantidad.to_bytes(4, byteorder='big'))
+                    except:
+                        pass
+                    try:
+                        client_socket.close()
+                    except:
+                        pass
+                    continue
+
+                # ===== CASO 3: RELAY DESDE EL BALANCEADOR (R) =====
+                # El balanceador reenvía aquí paquetes que otros servidores
+                # quieren distribuir a clientes de ESTE servidor.
+                if primer_byte == b'R':
+                    try:
+                        self._procesar_relay(client_socket)
+                    except Exception as e:
+                        self.log(f"[!] Error procesando relay: {e}", 'error')
+                    try:
+                        client_socket.close()
+                    except:
+                        pass
+                    continue
+
+                # ===== CASO 4: CLIENTE REAL (C) =====
+                if primer_byte != b'C':
+                    try:
+                        client_socket.close()
+                    except:
+                        pass
+                    continue
+
+                # ===== IDENTIDAD LÓGICA DEL CLIENTE =====
+                # Después de la 'C', el cliente envía el nombre lógico que ya tenía.
+                # En la primera conexión será el nombre asignado por el balanceador.
+                try:
+                    nombre_len_bytes = self.recibir_exacto_socket(client_socket, 2)
+                    nombre_len = int.from_bytes(nombre_len_bytes, byteorder='big')
+                    if nombre_len > 0:
+                        nombre_solicitado = self.recibir_exacto_socket(
+                            client_socket, nombre_len).decode('utf-8').strip()
+                    else:
+                        nombre_solicitado = ''
+                except Exception:
+                    nombre_solicitado = ''
+
+                # Si el cliente ya tiene un nombre (Cliente N), conservarlo.
+                if nombre_solicitado and re.fullmatch(r'Cliente\s+\d+', nombre_solicitado, re.IGNORECASE):
+                    nombre_cliente = self._normalizar_nombre_cliente(nombre_solicitado)
+                    numero = int(re.search(r'(\d+)', nombre_cliente).group(1))
+                    self.contador_clientes = max(self.contador_clientes, numero)
+
+                    # Si el socket anterior todavía figura como activo, reemplazarlo.
+                    for socket_anterior, info in list(self.clientes.items()):
+                        if (info.get('nombre', '').lower() == nombre_cliente.lower()
+                                and socket_anterior is not client_socket):
+                            try:
+                                socket_anterior.close()
+                            except:
+                                pass
+                            del self.clientes[socket_anterior]
+                            break
+                else:
+                    self.contador_clientes += 1
+                    nombre_cliente = f"Cliente {self.contador_clientes}"
+
+                # Guardar cliente con su lock de envío
                 self.clientes[client_socket] = {
                     "nombre": nombre_cliente,
                     "addr": addr,
-                    "ultimo_ping": time.time()
+                    "ultimo_ping": time.time(),
+                    "send_lock": threading.Lock()
                 }
 
-                #Le envia el mensaje y lo convierte a texto
+                # Confirmar nombre al cliente
                 try:
                     nombre_bytes = nombre_cliente.encode('utf-8')
                     client_socket.send(len(nombre_bytes).to_bytes(2, byteorder='big'))
@@ -436,17 +517,105 @@ class ServidorGUI:
                 self.log(f"[+] {nombre_cliente} conectado desde {addr[0]}:{addr[1]}", 'success')
                 self.actualizar_stats()
 
-                #Se crea un hilo para comuncairse conc ada cliente de forma independiente y no haya errores
                 threading.Thread(
                     target=self.manejar_cliente,
                     args=(client_socket, addr, nombre_cliente),
                     daemon=True
                 ).start()
-            except Exception as e:
-                if self.servidor_activo and self.es_activo:
-                    self.log(f"[!] Error aceptar: {e}", 'error')
-                    break
 
+            except OSError:
+                break
+            except Exception as e:
+                if self.servidor_activo and self.es_activo and self.server_socket is socket_escucha:
+                    self.log(f"[!] Error aceptar: {e}", 'error')
+                break
+    def recibir_exacto_socket(self, conn, tamano):
+        datos = b""
+        while len(datos) < tamano:
+            parte = conn.recv(tamano - len(datos))
+            if not parte:
+                raise ConnectionError("Conexión cerrada durante el registro del cliente")
+            datos += parte
+        return datos
+    def _procesar_relay(self, conn):
+        """
+        Recibe un paquete relay del balanceador y lo retransmite localmente.
+        NO lo reenvía al balanceador (evita loops).
+
+        Formato entrante (después del byte 'R'):
+          [4B puerto_origen][4B len_nombre][nombre][10B tamaño][20B destino][contenido]
+        """
+        # Leer puerto de origen
+        puerto_origen_bytes = self.recibir_exacto(conn, 4)
+        if len(puerto_origen_bytes) < 4:
+            return
+
+        # Leer metadatos
+        meta_len_bytes = self.recibir_exacto(conn, 4)
+        if len(meta_len_bytes) < 4:
+            return
+        nombre_len = int(meta_len_bytes.decode('utf-8'))
+
+        nombre_bytes = self.recibir_exacto(conn, nombre_len)
+        meta_size_bytes = self.recibir_exacto(conn, 10)
+        tamano_archivo = int(meta_size_bytes.decode('utf-8'))
+
+        destino_bytes = self.recibir_exacto(conn, 20)
+        destino = destino_bytes.decode('utf-8').strip()
+
+        contenido = self.recibir_exacto(conn, tamano_archivo)
+        if len(contenido) != tamano_archivo:
+            return
+
+        nombre_archivo = nombre_bytes.decode('utf-8')
+
+        # Construir paquete para enviar a los clientes locales
+        paquete = (
+                b'F'
+                + meta_len_bytes
+                + nombre_bytes
+                + meta_size_bytes
+                + contenido
+        )
+
+        # Retransmitir localmente según destino
+        if destino.upper() == 'ALL':
+            receptores = self.retransmitir(paquete, remitente=None)
+        else:
+            receptores = self.retransmitir_a_uno(
+                paquete, destino, remitente=None
+            )
+
+        self.log(
+            f"📥 [RELAY] '{nombre_archivo}' ({self.formatear_tamano(tamano_archivo)}) desde servidor remoto",
+            'transfer'
+        )
+        if receptores:
+            self.log(f"   ↳ Retransmitido localmente a: {', '.join(receptores)}", 'success')
+
+    def _enviar_relay_al_balanceador(self, meta_len_bytes, nombre_bytes,
+                                     meta_size_bytes, destino_bytes, contenido):
+        """Envía un paquete al hub de relay del balanceador para que lo
+        redistribuya a los otros servidores."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(3.0)
+            sock.connect((self.config_relay_host, self.config_relay_puerto))
+
+            # Formato: [4B puerto_origen][4B len_nombre][nombre][10B tamaño][20B destino][contenido]
+            puerto_origen_bytes = self.config_puerto.to_bytes(4, byteorder='big')
+            paquete = (
+                    puerto_origen_bytes
+                    + meta_len_bytes
+                    + nombre_bytes
+                    + meta_size_bytes
+                    + destino_bytes
+                    + contenido
+            )
+            sock.sendall(paquete)
+            sock.close()
+        except Exception as e:
+            self.log(f"[!] No se pudo enviar relay al balanceador: {e}", 'error')
     #Metodo que permite comunciacion de cada cliente de forma individual para el hilo ejecutado
     def manejar_cliente(self, conn, addr, nombre_cliente):
         try:
@@ -530,6 +699,17 @@ class ServidorGUI:
                     # Si el archivo le llegó a otros usuarios, se muestra en los logs
                     if receptores:
                         self.log(f"   ↳ Retransmitido a: {', '.join(receptores)}", 'success')
+
+                    # ===== RELAY A OTROS SERVIDORES =====
+                    # Enviar el mismo paquete al hub del balanceador para que
+                    # llegue a clientes conectados a OTROS servidores.
+                    threading.Thread(
+                        target=self._enviar_relay_al_balanceador,
+                        args=(meta_len_bytes, nombre_archivo.encode('utf-8'),
+                              meta_size_bytes, destino_bytes, bytes_recibidos),
+                        daemon=True
+                    ).start()
+                    # ===== FIN RELAY =====
 
         except Exception:
             # Captura cualquier error inesperado para evitar que el servidor colapse por completo

@@ -33,7 +33,10 @@ class ClienteGUI:
         self.tiempo_entre_intentos = self.config_tiempo_entre_intentos #Inicializa tiempo entre intentos = conf tiempo de intentos
         self.reconexiones_exitosas = 0 #Incializa reconexiones exitosas
         self.archivos_recibidos = 0 #Inicializa Archivos recibidos
-        self.socket = None # Incialzia el # de socket
+        self.socket = None
+        # CAMBIO: guarda el último servidor asignado para reconectar al mismo puerto.
+        self.servidor_host_actual = None
+        self.servidor_puerto_actual = None # Incialzia el # de socket
 
         self.root.grid_rowconfigure(0, weight=1)    #Responsivo de forma vertical
         self.root.grid_columnconfigure(0, weight=1) #Responsivo de forma horizontal
@@ -302,7 +305,6 @@ class ClienteGUI:
         self.config_timeout_transferencia = 30
         self.config_tamano_maximo = 2
         self.config_intervalo_ping = 3
-        self.config_intervalo_ping = 3
         self.config_host_balanceador = '127.0.0.1'
         self.config_puerto_balanceador = 6000
 
@@ -348,59 +350,110 @@ class ClienteGUI:
 
     # ==================== CONEXIÓN ====================
     def bucle_conexion(self):
-        while self.debe_reconectar: #Mientras debe_reconectar sea true
-            if not self.conectado:      #Si no esta coenctado
-                if self.intentar_conexion():  #Intenta reconectar
-                    threading.Thread(target=self.hilo_ping, daemon=True).start()  #Si falla llama al hilo ping
-                else:
-                    self.ciclo_reconexion() #Si no ejecuta el metodo
+        while self.debe_reconectar:
+            if not self.conectado:
+                # CAMBIO: si ya hay un ciclo de reconexión corriendo, no interferir.
+                # Esto evita que bucle_conexion y ciclo_reconexion intenten conectar a la vez.
+                if not self.reconectando:
+                    if self.intentar_conexion():
+                        threading.Thread(target=self.hilo_ping, daemon=True).start()
+                    else:
+                        self.ciclo_reconexion()
             else:
-                time.sleep(1)  #Cuando este conectado espera 1 segundo
+                time.sleep(1)
 
 
     def intentar_conexion(self):
-        try:
-            servidor_host, servidor_puerto = self.consultar_balanceador()
-            if servidor_host is None:
-                return False
-            # ===== FIN PASO 1 =====
+        """
+        Estrategia:
+        1. Si ya tenemos un servidor asignado → reintentar SIEMPRE ahí.
+           NUNCA preguntar al balanceador mientras tengamos asignación.
+           El balanceador ya se encarga de relanzarlo.
+        2. Solo si NO tenemos servidor (primera conexión) → preguntar al balanceador.
+        """
+        # ===== Si ya tenemos servidor asignado, solo reintentar ahí =====
+        if self.servidor_host_actual and self.servidor_puerto_actual:
+            if self._conectar_a(self.servidor_host_actual, self.servidor_puerto_actual):
+                return True
+            # No liberar la asignación. Seguir reintentando al MISMO servidor.
+            # El balanceador ya lo está relanzando.
+            self.log(
+                f"⏳ Esperando que {self.servidor_host_actual}:{self.servidor_puerto_actual} reviva...",
+                'reconnect'
+            )
+            return False
 
-            # ===== PASO 2: Conectarse al servidor real asignado =====
+        # ===== Solo si NO tenemos servidor, consultar al balanceador =====
+        servidor_host, servidor_puerto = self.consultar_balanceador()
+        if servidor_host is None:
+            return False
+        return self._conectar_a(servidor_host, servidor_puerto)
+
+    def _conectar_a(self, servidor_host, servidor_puerto):
+        """Intenta abrir una conexión al servidor especificado y completar el handshake."""
+        # Cerrar socket anterior si existe
+        try:
+            if self.socket:
+                self.socket.close()
+        except:
+            pass
+        self.socket = None
+
+        try:
+            # 1. Crear socket y conectar
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(self.config_timeout_conexion)
             self.socket.connect((servidor_host, servidor_puerto))
 
+            # 2. Guardar asignación
+            self.servidor_host_actual = servidor_host
+            self.servidor_puerto_actual = servidor_puerto
 
-            #Envia siempre los primeros 2 bytes del mensaje// indica la longitud exacta del nombre
-            self.socket.sendall(b'C')
+            # 3. Enviar identidad
+            nombre_para_servidor = self.nombre_cliente if self.nombre_cliente != "Cliente Desconocido" else ""
+            nombre_bytes = nombre_para_servidor.encode('utf-8')
+            self.socket.sendall(
+                b'C' + len(nombre_bytes).to_bytes(2, byteorder='big') + nombre_bytes
+            )
 
+            # 4. Recibir confirmación del servidor
             nombre_len_bytes = self.recibir_exacto(2)
             if not nombre_len_bytes or len(nombre_len_bytes) < 2:
-                return False
+                raise ConnectionError("El servidor no respondió correctamente")
 
-            nombre_len = int.from_bytes(nombre_len_bytes, byteorder='big') #Convierete los 2 bytes en numeros enteros
-            nombre_bytes = self.recibir_exacto(nombre_len) # Le indica indica los siguientes 10 bytes
-            self.nombre_cliente = nombre_bytes.decode('utf-8') #Lo transforma en texto normal y se obtiene el nombre del cliente que le dio el servidor
+            nombre_len = int.from_bytes(nombre_len_bytes, byteorder='big')
+            nombre_bytes = self.recibir_exacto(nombre_len)
+            self.nombre_cliente = nombre_bytes.decode('utf-8')
 
-
-            #Avisa que ya esta conectado y resetea todo en dado caso que estuviera reconectandose
+            # 5. Actualizar estado
             self.conectado = True
             self.reconectando = False
             self.intentos_actuales = 0
 
-            #Apenas genere coenxion cambia la ventana del cliente por nombre de cliente - xxxxxx
             self.root.after(0, lambda: self.root.title(
                 f"{self.nombre_cliente} - Distribución de Archivos"))
             self.root.after(0, lambda: self.nombre_label.config(
                 text=f"📁 {self.nombre_cliente}", fg='#a6e3a1'))
 
-            #Inserta al log aprobacion de conexion y nombre del cliente
-            self.log(f"✓ Conectado como {self.nombre_cliente}", 'success')
-            self.root.after(0, self.actualizar_estado_conectado) #Actualiza el estado
+            self.log(
+                f"✓ Conectado como {self.nombre_cliente} en {servidor_host}:{servidor_puerto}",
+                'success'
+            )
+            self.root.after(0, self.actualizar_estado_conectado)
 
-            self.socket.settimeout(self.config_timeout_transferencia) #Se actualiza el tiempo limite de tranferencia de 30
+            self.socket.settimeout(self.config_timeout_transferencia)
             return True
-        except:
+
+        except Exception as e:
+            # Cerrar socket fallido
+            try:
+                if self.socket:
+                    self.socket.close()
+            except:
+                pass
+            self.socket = None
+            self.conectado = False
+            self.log(f"[!] Falló conexión a {servidor_host}:{servidor_puerto}: {e}", 'error')
             return False
 
 
@@ -420,44 +473,49 @@ class ClienteGUI:
 
         self.log(f"⚠️ Servidor caído. {self.max_intentos} intentos cada {self.tiempo_entre_intentos}s...", 'warning')
 
+        # CAMBIO: se usa un bucle en lugar de llamarse recursivamente a sí mismo.
+        # Evita acumular llamadas en la pila si el servidor permanece caído durante mucho tiempo.
+        while self.debe_reconectar:
+            self.intentos_actuales = 0
 
-        #Se incrementa los intentos dentro del rango de max intentos
-        while self.intentos_actuales < self.max_intentos and self.debe_reconectar:
-            self.intentos_actuales += 1
+            while self.intentos_actuales < self.max_intentos and self.debe_reconectar:
+                self.intentos_actuales += 1
 
-            # Muestra la cantidad de intentos sobre el total
-            self.root.after(0, lambda i=self.intentos_actuales: self.actualizar_ui_intentos(i))
-            self.log(f"🔄 Intento {self.intentos_actuales}/{self.max_intentos}...", 'reconnect')
+                # Muestra la cantidad de intentos sobre el total
+                self.root.after(0, lambda i=self.intentos_actuales: self.actualizar_ui_intentos(i))
+                self.log(f"🔄 Intento {self.intentos_actuales}/{self.max_intentos}...", 'reconnect')
 
+                #Entre intentos espera el tiempo correspodiente en trozos de 1s
+                for _ in range(self.tiempo_entre_intentos):
+                    if not self.debe_reconectar:
+                        self.reconectando = False
+                        return
+                    time.sleep(1)
 
-            #Entre intentos espera el tiempo correspodiente en trozos de 1s
-            for _ in range(self.tiempo_entre_intentos):
-                if not self.debe_reconectar:
+                # CAMBIO: intentar_conexion conserva el mismo servidor si ya existe una asignación.
+                if self.intentar_conexion():
+                    self.reconexiones_exitosas += 1
+                    self.root.after(0, self.actualizar_contador_reconexiones)
+                    self.reconectando = False
+                    threading.Thread(target=self.hilo_ping, daemon=True).start()
                     return
-                time.sleep(1)
 
-            #Si un intento tiene exito incrementa contador de reconexiones lanza hilo ping y termina
-            if self.intentar_conexion():
-                self.reconexiones_exitosas += 1
-                self.root.after(0, self.actualizar_contador_reconexiones)
+            if not self.debe_reconectar:
                 self.reconectando = False
-                threading.Thread(target=self.hilo_ping, daemon=True).start()
                 return
 
-        #Apenas terminen el max de intentos lanza mensajes y lo vuelve a intentar
-        self.log(f"❌ Se agotaron los {self.max_intentos} intentos. Nuevo ciclo en {self.tiempo_entre_intentos}s...", 'error')
-        self.root.after(0, lambda: self.conn_status_label.config(
-            text="🔴 Servidor no disponible",
-            fg='#f38ba8'))
-        self.root.after(0, lambda: self.reconnect_status.config(
-            text=f"⏳ Reintentando en {self.tiempo_entre_intentos}s...",
-            fg='#f38ba8'))
+            #Apenas terminen el max de intentos lanza mensajes y comienza otro ciclo
+            self.log(f"❌ Se agotaron los {self.max_intentos} intentos. Nuevo ciclo en {self.tiempo_entre_intentos}s...", 'error')
+            self.root.after(0, lambda: self.conn_status_label.config(
+                text="🔴 Servidor no disponible",
+                fg='#f38ba8'))
+            self.root.after(0, lambda: self.reconnect_status.config(
+                text=f"⏳ Reintentando en {self.tiempo_entre_intentos}s...",
+                fg='#f38ba8'))
 
-        #Espera  el tiempo entre intentis y llama las funciones de forma recursiva
-        time.sleep(self.tiempo_entre_intentos)
+            time.sleep(self.tiempo_entre_intentos)
+
         self.reconectando = False
-        if self.debe_reconectar:
-            self.ciclo_reconexion()
 
     #Actualiza etiquetas de estado durante la reconexion
     def actualizar_ui_intentos(self, intento):
@@ -485,7 +543,10 @@ class ClienteGUI:
                 time.sleep(self.config_intervalo_ping)
                 if self.conectado and self.socket:
                     self.socket.sendall(b'P')
-            except:
+            except Exception:
+                # CAMBIO: si falla el ping, se fuerza la desconexión para iniciar la reconexión.
+                if self.conectado:
+                    self.desconectar()
                 break
 
     # ==================== RECEPCIÓN ====================
@@ -495,18 +556,22 @@ class ClienteGUI:
         while self.debe_reconectar:
             if self.conectado and self.socket:
                 try:
-                    tipo = self.socket.recv(1)  #Si esta conectado en 1  byte para saber el mensaje
+                    tipo = self.socket.recv(1)  #Si esta conectado en 1 byte para saber el mensaje
                     if not tipo:
                         self.desconectar()
                         continue
                     #Si recibe F llama al metodo
                     if tipo == b'F':
                         self.recibir_archivo()
-                    elif tipo == b'PONG': #Si recibe PONG no hace nada ya que pong consta de 4 bytes
-                        pass
+                    elif tipo == b'P':
+                        # CAMBIO: el servidor responde PONG (4 bytes). Como ya leímos la P,
+                        # consumimos los 3 bytes restantes para mantener sincronizado el protocolo.
+                        respuesta_pong = self.recibir_exacto(3)
+                        if respuesta_pong != b'ONG':
+                            self.log("[!] Respuesta PONG inválida", 'warning')
                 except socket.timeout:
                     continue
-                except:
+                except Exception:
                     if self.conectado:
                         self.desconectar()
                     time.sleep(0.5)
@@ -579,6 +644,7 @@ class ClienteGUI:
                 self.socket.close()
         except:
             pass
+        self.socket = None
 
         self.root.after(0, lambda: self.btn_enviar.config(state=tk.DISABLED))
         self.root.after(0, lambda: self.conn_status_label.config(
@@ -587,29 +653,45 @@ class ClienteGUI:
 
         self.log("⚠️ Conexión perdida", 'warning')
 
+        # CAMBIO: solo lanzar ciclo de reconexión si no hay uno corriendo ya.
         if self.debe_reconectar and not self.reconectando:
             threading.Thread(target=self.ciclo_reconexion, daemon=True).start()
 
 
         # ==================== CONSULTA AL BALANCEADOR ====================
     def consultar_balanceador(self):
-        """Se conecta al balanceador, recibe 'host:puerto\\n' y devuelve (host, puerto)."""
+        """Se conecta al balanceador, envía su identidad actual (si la tiene)
+        y recibe 'host:puerto|Cliente N'."""
         try:
-            sock_temp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock_temp.settimeout(self.config_timeout_conexion)
-            sock_temp.connect((self.config_host_balanceador, self.config_puerto_balanceador))
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock_temp:
+                sock_temp.settimeout(self.config_timeout_conexion)
+                sock_temp.connect((self.config_host_balanceador, self.config_puerto_balanceador))
 
-            respuesta = sock_temp.recv(1024).decode('utf-8').strip()
-            sock_temp.close()
+                # ===== ENVIAR IDENTIDAD =====
+                # Si ya tenemos un nombre ("Cliente N"), pedimos reasignación al MISMO servidor.
+                # Si no, somos un cliente nuevo.
+                if self.nombre_cliente and self.nombre_cliente != "Cliente Desconocido":
+                    mensaje = f"REASIGNAR|{self.nombre_cliente}".encode('utf-8')
+                else:
+                    mensaje = b"NUEVO"
+                sock_temp.sendall(mensaje)
 
-            host, puerto = respuesta.split(':')
-            self.log(f"📡 Balanceador asignó: {host}:{puerto}", 'info')
+                respuesta = sock_temp.recv(1024).decode('utf-8').strip()
+
+            partes = respuesta.split('|', 1)
+            host, puerto = partes[0].split(':')
+
+            if len(partes) == 2 and partes[1].strip():
+                self.nombre_cliente = partes[1].strip()
+
+            self.log(
+                f"📡 Balanceador asignó: {host}:{puerto} para {self.nombre_cliente}",
+                'info'
+            )
             return host, int(puerto)
         except Exception as e:
             self.log(f"[!] No se pudo contactar al balanceador: {e}", 'error')
-            return None, None
-
-    # ==================== ENVÍO ====================
+            return None, None    # ==================== ENVÍO ====================
 
 
     def enviar_archivo_dialogo(self):

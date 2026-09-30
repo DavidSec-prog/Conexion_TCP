@@ -1,6 +1,7 @@
 # balanceador.py
 import configparser
 import os
+import re
 import socket
 import threading
 import subprocess
@@ -9,20 +10,22 @@ import time
 from apscheduler.schedulers.background import BackgroundScheduler
 
 
-
 class Balanceador:
     def __init__(self):
         self.cargar_configuracion()
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.servidores = []
         self.activo = True
         self.total_dinamicos = 0
+        self.contador_clientes_global = 0
+        # CAMBIO: registro de qué puerto tiene asignado cada cliente.
+        # Permite que al reconectar vuelva al MISMO servidor.
+        self.registro_clientes = {}
 
         self._lanzar_servidores_iniciales()
-
+        threading.Thread(target=self._servidor_relay, daemon=True).start() #Hilo donde retrasmiten a otros servidores
 
         self.scheduler = BackgroundScheduler()
-        # verificar salud de cada servidor cada 2 segundos.
         self.scheduler.add_job(
             self._tarea_verificar_servidores,
             'interval',
@@ -30,7 +33,6 @@ class Balanceador:
             id='health_check',
             replace_existing=True
         )
-        # monitoreo de conexiones cada 5 segundos (log de estado).
         self.scheduler.add_job(
             self._tarea_monitorear_conexiones,
             'interval',
@@ -46,10 +48,11 @@ class Balanceador:
         self.config_servidores_iniciales = "127.0.0.1:5000"
         self.config_max_clientes = 3
         self.config_puerto_balanceador = 6000
-        self.config_puerto_base_dinamico = 5002
+        self.config_puerto_base_dinamico = 5010
         self.config_intervalo_health_check = 2
         self.config_timeout_health_check = 5
         self.tiempo_relanzamiento = 10
+        self.config_puerto_relay = 6001
 
         if os.path.exists('config.ini'):
             config.read('config.ini')
@@ -66,10 +69,12 @@ class Balanceador:
                     'intervalo_health_check', self.config_intervalo_health_check))
                 self.config_timeout_health_check = int(config['BALANCEADOR'].get(
                     'timeout_health_check', self.config_timeout_health_check))
+                self.config_puerto_relay = int(config['BALANCEADOR'].get(
+                    'puerto_relay', self.config_puerto_relay))
 
     # ==================== HEALTH CHECK ====================
+    #Validar el estado de los servidores con Ping
     def ping_servidor(self, puerto, timeout=1.0):
-        """Ping rápido con timeout configurable."""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(timeout)
@@ -80,11 +85,14 @@ class Balanceador:
         except:
             return False
 
-    # ==================== LANZAMIENTO DE SERVIDORES ====================
+    # ==================== LANZAMIENTO ====================
+    #Lanza los subprovesos que ejecuta el servidor.py
     def _crear_proceso_servidor(self, puerto):
         try:
             env = os.environ.copy()
             env['SERVIDOR_PUERTO'] = str(puerto)
+            env['SERVIDOR_RELAY_PUERTO'] = str(self.config_puerto_relay)
+            env['SERVIDOR_RELAY_HOST'] = '127.0.0.1'
             directorio = os.path.dirname(os.path.abspath(__file__))
             script = os.path.join(directorio, 'servidor.py')
             proceso = subprocess.Popen(
@@ -107,11 +115,14 @@ class Balanceador:
         except Exception as e:
             print(f"[BALANCEADOR] Error lanzando servidor en {puerto}: {e}")
             return None
-
+    # Solo arranca els ervidor incial de ñpuerto 5000
     def _lanzar_servidores_iniciales(self):
         print("[BALANCEADOR] Lanzando servidores iniciales...")
         for entrada in self.config_servidores_iniciales.split(','):
-            host, puerto = entrada.strip().split(':')
+            entrada = entrada.strip()
+            if not entrada:
+                continue
+            host, puerto = entrada.split(':')
             puerto = int(puerto)
             proceso = self._crear_proceso_servidor(puerto)
             with self.lock:
@@ -119,33 +130,35 @@ class Balanceador:
                     "puerto": puerto,
                     "clientes_actuales": 0,
                     "proceso": proceso,
-                    "caido": False,
-                    "relanzando": False,
+                    "caido": proceso is None,
+                    "relanzando": proceso is None,
+                    "iniciando": False,
                     "es_dinamico": False
                 })
+                if proceso is None:
+                    threading.Thread(
+                        target=self._relanzar_servidor,
+                        args=(puerto,),
+                        daemon=True
+                    ).start()
 
-    # WATCHDOG GLOBAL - APSCHEDULER
+    # ==================== WATCHDOG ====================
+    # Detecta las caidas y genera un relazamiento del mismo servidor caido
     def _tarea_verificar_servidores(self):
-        """
-        Verifica la salud de cada servidor y relanza los que se cayeron.
-        """
         if not self.activo:
             return
-
         with self.lock:
             servidores_copia = list(self.servidores)
-
         for s in servidores_copia:
-            if s.get("relanzando") or s.get("caido"):
+            if s.get("iniciando") or s.get("relanzando"):
                 continue
-
-            if not self.ping_servidor(s["puerto"]):
+            if not self.ping_servidor(s["puerto"], timeout=self.config_timeout_health_check):
                 print(f"Servidor {s['puerto']} no responde")
                 with self.lock:
+                    if s.get("caido") or s.get("relanzando"):
+                        continue
                     s["caido"] = True
                     s["relanzando"] = True
-                    s["clientes_actuales"] = 0
-
                 threading.Thread(
                     target=self._relanzar_servidor,
                     args=(s["puerto"],),
@@ -153,24 +166,18 @@ class Balanceador:
                 ).start()
 
     def _tarea_monitorear_conexiones(self):
-        """
-        Muestra en consola el estado de todos los servidores.
-        Sirve para trazabilidad y monitoreo continuo.
-        """
         if not self.activo:
             return
-
         with self.lock:
             total = len(self.servidores)
             vivos = sum(1 for s in self.servidores
                         if not s.get("caido") and not s.get("relanzando"))
             clientes_totales = sum(s["clientes_actuales"] for s in self.servidores)
-
         print(f"[MONITOR] Servidores: {vivos}/{total} vivos | "
               f"Clientes asignados: {clientes_totales}")
 
+    # Relanza el mismo puerto caido, no genra dinamicos aca
     def _relanzar_servidor(self, puerto):
-        """Espera el countdown y relanza UN servidor en el MISMO puerto."""
         print("=" * 60)
         print(f"  ⚠️  Servidor {puerto} se ha cerrado")
         print(f"  🔄 Protocolo de recuperación activado")
@@ -186,38 +193,68 @@ class Balanceador:
         if not self.activo:
             return
 
+        # Verificar antes de crear (evita duplicados)
+        if self.ping_servidor(puerto):
+            print(f"[WATCHDOG] Servidor {puerto} ya está vivo. Cancelando relanzamiento.")
+            with self.lock:
+                for s in self.servidores:
+                    if s["puerto"] == puerto:
+                        s["caido"] = False
+                        s["relanzando"] = False
+                        s["iniciando"] = False
+                        break
+            return
+
         proceso = self._crear_proceso_servidor(puerto)
         with self.lock:
             for s in self.servidores:
                 if s["puerto"] == puerto:
                     s["proceso"] = proceso
-                    s["caido"] = False
-                    s["relanzando"] = False
-                    s["clientes_actuales"] = 0
+                    s["caido"] = proceso is None
+                    s["relanzando"] = proceso is None
+                    s["iniciando"] = False
                     break
-        print(f"[WATCHDOG] ✓ Servidor {puerto} relanzado")
+        if proceso is not None:
+            print(f"[WATCHDOG] ✓ Servidor {puerto} relanzado")
+        else:
+            print(f"[WATCHDOG] ⚠️ No fue posible relanzar {puerto}")
 
-    # ==================== ASIGNACIÓN (CON REGLAS ESTRICTAS) ====================
-    def asignar_servidor(self):
+    # ==================== ASIGNACIÓN ====================
+    # Recoenxion con el mismo servidor
+    def asignar_servidor(self, nombre_cliente=None):
         """
-        Reglas de asignación:
-        1. Ping inmediato a cada servidor para conocer su estado real AHORA.
-        2. Si hay vivos con espacio → asignar al menos cargado.
-        3. Si NO hay vivos con espacio PERO hay algún caído/relanzando → devolverlo.
+        Reglas:
+        0. Si el cliente YA tenía un puerto asignado, devolverlo (aunque esté relanzando).
            El cliente reintentará hasta que reviva. NO se crea dinámico.
-        4. Si todos vivos y llenos → crear dinámico.
+        1. Si hay vivos con espacio → asignar al menos cargado.
+        2. Si no hay vivos con espacio pero hay alguno relanzando/iniciando → devolverlo.
+        3. Si todos vivos y llenos → crear UN dinámico.
         """
         with self.lock:
-            # ===== PASO 1: Actualizar estado real de cada servidor =====
+            # ===== PASO 0: REGLA DE REASIGNACIÓN =====
+            if nombre_cliente and nombre_cliente in self.registro_clientes:
+                puerto_original = self.registro_clientes[nombre_cliente]
+                for s in self.servidores:
+                    if s["puerto"] != puerto_original:
+                        continue
+                    if s.get("relanzando") or s.get("iniciando"):
+                        print(f"[BALANCEADOR] {nombre_cliente} vuelve a "
+                              f"{puerto_original} (relanzando)")
+                        return s
+                    if (not s.get("caido")
+                            and s["clientes_actuales"] < self.config_max_clientes):
+                        print(f"[BALANCEADOR] {nombre_cliente} vuelve a {puerto_original}")
+                        return s
+                    break
+
+            # ===== PASO 1: actualizar estado real =====
             for s in self.servidores:
-                if s.get("relanzando"):
+                if s.get("iniciando") or s.get("relanzando"):
                     continue
                 if not self.ping_servidor(s["puerto"], timeout=0.5):
                     if not s.get("caido"):
-                        # Recién caído → marcar y lanzar relanzamiento
                         s["caido"] = True
                         s["relanzando"] = True
-                        s["clientes_actuales"] = 0
                         print(f"[BALANCEADOR] Servidor {s['puerto']} detectado caído al asignar")
                         threading.Thread(
                             target=self._relanzar_servidor,
@@ -225,37 +262,40 @@ class Balanceador:
                             daemon=True
                         ).start()
                 else:
-                    # Si estaba caído y ahora responde → marcarlo vivo
                     if s.get("caido") and not s.get("relanzando"):
                         s["caido"] = False
 
-            # ===== PASO 2: Buscar vivos con espacio =====
+            # ===== PASO 2: vivos con espacio =====
             vivos_con_espacio = [
                 s for s in self.servidores
                 if not s.get("caido") and not s.get("relanzando")
                    and s["clientes_actuales"] < self.config_max_clientes
             ]
-
             if vivos_con_espacio:
                 mejor = min(vivos_con_espacio, key=lambda s: s["clientes_actuales"])
                 mejor["clientes_actuales"] += 1
                 return mejor
 
-            # ===== PASO 3: ¿Hay algún servidor caído/relanzando? =====
-            # ⭐ Si SÍ → devolverlo. El cliente reintentará hasta que reviva.
-            # ⭐ NO se crea dinámico.
-            caidos = [
+            # ===== PASO 3: pendientes (iniciando o relanzando) =====
+            pendientes = [
                 s for s in self.servidores
-                if s.get("caido") or s.get("relanzando")
+                if (s.get("iniciando") or s.get("relanzando"))
+                   and s["clientes_actuales"] < self.config_max_clientes
             ]
-            if caidos:
-                print(f"[BALANCEADOR] Sin espacio, pero hay {len(caidos)} servidor(es) por revivir")
-                print(f"[BALANCEADOR] Cliente reintentará hasta que {caidos[0]['puerto']} vuelva")
-                return caidos[0]
+            if pendientes:
+                mejor = min(pendientes, key=lambda s: s["clientes_actuales"])
+                estado = "iniciando" if mejor.get("iniciando") else "relanzando"
+                print(f"[BALANCEADOR] Servidor {mejor['puerto']} {estado}; "
+                      f"cliente reservado")
+                return mejor
 
-            # ===== PASO 4: Todos vivos y llenos → crear dinámico =====
-            print("[BALANCEADOR] Todos los servidores vivos y llenos → creando dinámico")
+            # ===== PASO 4: crear dinámico =====
             nuevo_puerto = self.config_puerto_base_dinamico + self.total_dinamicos
+            puertos_existentes = {s["puerto"] for s in self.servidores}
+            while nuevo_puerto in puertos_existentes:
+                self.total_dinamicos += 1
+                nuevo_puerto = self.config_puerto_base_dinamico + self.total_dinamicos
+
             self.total_dinamicos += 1
             nuevo = {
                 "puerto": nuevo_puerto,
@@ -263,17 +303,133 @@ class Balanceador:
                 "proceso": None,
                 "caido": False,
                 "relanzando": False,
+                "iniciando": True,
                 "es_dinamico": True
             }
             self.servidores.append(nuevo)
-            print(f"[ESCALAMIENTO] Creando servidor {nuevo_puerto} para el cliente nuevo")
+            print(f"[ESCALAMIENTO] Creando servidor {nuevo_puerto}")
 
-        # Lanzar el proceso FUERA del lock (tarda ~5s)
-        proceso = self._crear_proceso_servidor(nuevo_puerto)
+        proceso = self._crear_proceso_servidor(nuevo["puerto"])
         with self.lock:
             nuevo["proceso"] = proceso
-        print(f"[ESCALAMIENTO] ✓ Servidor {nuevo_puerto} listo")
+            nuevo["iniciando"] = False
+            nuevo["caido"] = proceso is None
+            nuevo["relanzando"] = proceso is None
+
+        if proceso is not None:
+            print(f"[ESCALAMIENTO] ✓ Servidor {nuevo['puerto']} listo")
+        else:
+            print(f"[ESCALAMIENTO] ⚠️ Servidor {nuevo['puerto']} no pudo iniciar")
+
         return nuevo
+        # ==================== HUB DE RELAY ENTRE SERVIDORES ====================
+    # Este meotodo esucha el puerto 6001 cuando un servidor quiere enviar un archivo a otro servidor se concete por este puerto
+    def _servidor_relay(self):
+        """
+        Escucha en el puerto de relay (6001) los paquetes que los servidores
+        quieren redistribuir a OTROS servidores. Reenvía cada paquete a todos
+        los servidores EXCEPTO al que lo envió.
+        """
+        try:
+            relay_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            relay_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            relay_socket.bind(("127.0.0.1", self.config_puerto_relay))
+            relay_socket.listen(10)
+            print(f"[RELAY] Hub escuchando en 127.0.0.1:{self.config_puerto_relay}")
+        except Exception as e:
+            print(f"[RELAY] Error abriendo puerto relay: {e}")
+            return
+
+        while self.activo:
+            try:
+                conn, _ = relay_socket.accept()
+            except OSError:
+                break
+
+            threading.Thread(
+                target=self._procesar_relay,
+                args=(conn,),
+                daemon=True
+            ).start()
+    #  Este es HUb del sistema que distribuye el archivo entre los servidores
+    def _procesar_relay(self, conn):
+        """
+        Protocolo de entrada (servidor → balanceador):
+          [4B puerto_origen][4B len_nombre][nombre][10B tamaño][20B destino][contenido]
+        El balanceador agrega un byte 'R' al inicio y reenvía a los demás servidores.
+        """
+        try:
+            conn.settimeout(30.0)
+
+            # Leer puerto de origen (4 bytes)
+            puerto_origen_bytes = self._recibir_exacto(conn, 4)
+            if len(puerto_origen_bytes) < 4:
+                return
+            puerto_origen = int.from_bytes(puerto_origen_bytes, byteorder='big')
+
+            # Leer metadatos del paquete
+            meta_len_bytes = self._recibir_exacto(conn, 4)
+            if len(meta_len_bytes) < 4:
+                return
+            nombre_len = int(meta_len_bytes.decode('utf-8'))
+
+            nombre_bytes = self._recibir_exacto(conn, nombre_len)
+            meta_size_bytes = self._recibir_exacto(conn, 10)
+            tamano_archivo = int(meta_size_bytes.decode('utf-8'))
+
+            destino_bytes = self._recibir_exacto(conn, 20)
+
+            contenido = self._recibir_exacto(conn, tamano_archivo)
+            if len(contenido) != tamano_archivo:
+                return
+
+            # Construir paquete relay: 'R' + puerto_origen + paquete original
+            paquete_relay = (
+                    b'R'
+                    + puerto_origen_bytes
+                    + meta_len_bytes
+                    + nombre_bytes
+                    + meta_size_bytes
+                    + destino_bytes
+                    + contenido
+            )
+
+            # Reenviar a TODOS los servidores excepto al origen
+            with self.lock:
+                servidores_copia = list(self.servidores)
+
+            for s in servidores_copia:
+                if s["puerto"] == puerto_origen:
+                    continue
+                if s.get("caido") or s.get("relanzando"):
+                    continue
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(3.0)
+                    sock.connect(("127.0.0.1", s["puerto"]))
+                    sock.sendall(paquete_relay)
+                    sock.close()
+                    print(f"[RELAY] Reenviado a servidor {s['puerto']}")
+                except Exception as e:
+                    print(f"[RELAY] No se pudo reenviar a {s['puerto']}: {e}")
+
+        except Exception as e:
+            print(f"[RELAY] Error procesando relay: {e}")
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
+
+    def _recibir_exacto(self, conn, tamano):
+        """Lectura exacta de N bytes desde un socket."""
+        datos = b""
+        while len(datos) < tamano:
+            chunk = conn.recv(min(4096, tamano - len(datos)))
+            if not chunk:
+                return datos
+            datos += chunk
+        return datos
 
     def mostrar_estado(self):
         print(f"Máximo de clientes por servidor: {self.config_max_clientes}")
@@ -281,13 +437,16 @@ class Balanceador:
         print("Servidores actuales:")
         with self.lock:
             for s in self.servidores:
-                if s.get("relanzando"):
+                if s.get("iniciando"):
+                    estado = "INICIANDO"
+                elif s.get("relanzando"):
                     estado = "RELANZANDO"
                 elif s.get("caido"):
                     estado = "CAÍDO"
                 else:
                     estado = "VIVO"
-                print(f"  - 127.0.0.1:{s['puerto']} | clientes: {s['clientes_actuales']} | {estado}")
+                print(f"  - 127.0.0.1:{s['puerto']} | clientes: "
+                      f"{s['clientes_actuales']} | {estado}")
 
     # ==================== RED ====================
     def iniciar(self):
@@ -312,14 +471,56 @@ class Balanceador:
             self.cerrar()
 
     def atender_cliente(self, conn, addr):
+        """
+        Protocolo cliente → balanceador:
+          - "NUEVO"                 → cliente nuevo
+          - "REASIGNAR|Cliente N"   → cliente que ya tenía nombre, quiere volver
+        Respuesta balanceador → cliente:
+          - "host:puerto|Cliente N"
+        """
         try:
-            servidor = self.asignar_servidor()
+            # ===== LEER IDENTIDAD DEL CLIENTE =====
+            try:
+                conn.settimeout(2.0)
+                mensaje = conn.recv(1024).decode('utf-8').strip()
+            except:
+                mensaje = "NUEVO"
+
+            # ===== DECIDIR NOMBRE =====
+            nombre_cliente = None
+            if mensaje.startswith("REASIGNAR|"):
+                nombre_solicitado = mensaje.split("|", 1)[1].strip()
+                # Validar formato "Cliente N"
+                if re.fullmatch(r"Cliente\s+\d+", nombre_solicitado, re.IGNORECASE):
+                    numero = int(re.search(r"\d+", nombre_solicitado).group())
+                    nombre_cliente = f"Cliente {numero}"
+                    # Sincronizar el contador global sin incrementarlo
+                    with self.lock:
+                        self.contador_clientes_global = max(
+                            self.contador_clientes_global, numero
+                        )
+
+            if nombre_cliente is None:
+                # Cliente nuevo → asignar nombre nuevo
+                with self.lock:
+                    self.contador_clientes_global += 1
+                    nombre_cliente = f"Cliente {self.contador_clientes_global}"
+
+            # ===== ASIGNAR SERVIDOR =====
+            servidor = self.asignar_servidor(nombre_cliente)
             if servidor is None:
                 conn.sendall(b"ERROR:NO_SERVIDORES\n")
                 return
-            respuesta = f"127.0.0.1:{servidor['puerto']}\n"
+
+            # ===== REGISTRAR =====
+            with self.lock:
+                self.registro_clientes[nombre_cliente] = servidor["puerto"]
+
+            respuesta = f"127.0.0.1:{servidor['puerto']}|{nombre_cliente}\n"
             conn.sendall(respuesta.encode('utf-8'))
-            print(f"[BALANCEADOR] Cliente desde {addr[0]} -> asignado a 127.0.0.1:{servidor['puerto']}")
+            print(f"[BALANCEADOR] {nombre_cliente} desde {addr[0]} -> "
+                  f"127.0.0.1:{servidor['puerto']}")
+
         except Exception as e:
             print(f"[BALANCEADOR] Error atendiendo a {addr[0]}: {e}")
         finally:
@@ -330,10 +531,9 @@ class Balanceador:
         print("\n[BALANCEADOR] Cerrando y matando servidores hijos...")
         self.activo = False
 
-        # ===== Apagar APScheduler limpiamente =====
         if hasattr(self, 'scheduler') and self.scheduler.running:
             self.scheduler.shutdown(wait=False)
-            print(" detenido")
+            print("  [SCHEDULER] detenido")
 
         with self.lock:
             for s in self.servidores:
