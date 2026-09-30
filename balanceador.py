@@ -6,6 +6,8 @@ import threading
 import subprocess
 import sys
 import time
+from apscheduler.schedulers.background import BackgroundScheduler
+
 
 
 class Balanceador:
@@ -17,7 +19,27 @@ class Balanceador:
         self.total_dinamicos = 0
 
         self._lanzar_servidores_iniciales()
-        threading.Thread(target=self._watchdog_global, daemon=True).start()
+
+
+        self.scheduler = BackgroundScheduler()
+        # verificar salud de cada servidor cada 2 segundos.
+        self.scheduler.add_job(
+            self._tarea_verificar_servidores,
+            'interval',
+            seconds=self.config_intervalo_health_check,
+            id='health_check',
+            replace_existing=True
+        )
+        # monitoreo de conexiones cada 5 segundos (log de estado).
+        self.scheduler.add_job(
+            self._tarea_monitorear_conexiones,
+            'interval',
+            seconds=5,
+            id='monitorear_conexiones',
+            replace_existing=True
+        )
+        self.scheduler.start()
+        print("[SCHEDULER] Iniciado con 2 tareas programadas")
 
     def cargar_configuracion(self):
         config = configparser.ConfigParser()
@@ -102,39 +124,50 @@ class Balanceador:
                     "es_dinamico": False
                 })
 
-    # ==================== WATCHDOG GLOBAL (SOLO CAÍDAS) ====================
-    def _watchdog_global(self):
+    # WATCHDOG GLOBAL - APSCHEDULER
+    def _tarea_verificar_servidores(self):
         """
-        Cada 'intervalo_health_check' segundos:
-          - Verifica salud de cada servidor.
-          - Si uno se cayó → lo relanza SOLO ese (mismo puerto).
-        NO crea dinámicos. NO crea backups. NO duplica.
+        Verifica la salud de cada servidor y relanza los que se cayeron.
         """
-        while self.activo:
-            time.sleep(self.config_intervalo_health_check)
-            if not self.activo:
-                break
+        if not self.activo:
+            return
 
-            with self.lock:
-                servidores_copia = list(self.servidores)
+        with self.lock:
+            servidores_copia = list(self.servidores)
 
-            for s in servidores_copia:
-                # Si ya está marcado como caído o relanzándose, no hacer nada
-                if s.get("relanzando") or s.get("caido"):
-                    continue
+        for s in servidores_copia:
+            if s.get("relanzando") or s.get("caido"):
+                continue
 
-                if not self.ping_servidor(s["puerto"]):
-                    print(f"[WATCHDOG] ⚠️ Servidor {s['puerto']} no responde")
-                    with self.lock:
-                        s["caido"] = True
-                        s["relanzando"] = True
-                        s["clientes_actuales"] = 0
+            if not self.ping_servidor(s["puerto"]):
+                print(f"Servidor {s['puerto']} no responde")
+                with self.lock:
+                    s["caido"] = True
+                    s["relanzando"] = True
+                    s["clientes_actuales"] = 0
 
-                    threading.Thread(
-                        target=self._relanzar_servidor,
-                        args=(s["puerto"],),
-                        daemon=True
-                    ).start()
+                threading.Thread(
+                    target=self._relanzar_servidor,
+                    args=(s["puerto"],),
+                    daemon=True
+                ).start()
+
+    def _tarea_monitorear_conexiones(self):
+        """
+        Muestra en consola el estado de todos los servidores.
+        Sirve para trazabilidad y monitoreo continuo.
+        """
+        if not self.activo:
+            return
+
+        with self.lock:
+            total = len(self.servidores)
+            vivos = sum(1 for s in self.servidores
+                        if not s.get("caido") and not s.get("relanzando"))
+            clientes_totales = sum(s["clientes_actuales"] for s in self.servidores)
+
+        print(f"[MONITOR] Servidores: {vivos}/{total} vivos | "
+              f"Clientes asignados: {clientes_totales}")
 
     def _relanzar_servidor(self, puerto):
         """Espera el countdown y relanza UN servidor en el MISMO puerto."""
@@ -296,6 +329,12 @@ class Balanceador:
     def cerrar(self):
         print("\n[BALANCEADOR] Cerrando y matando servidores hijos...")
         self.activo = False
+
+        # ===== Apagar APScheduler limpiamente =====
+        if hasattr(self, 'scheduler') and self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
+            print(" detenido")
+
         with self.lock:
             for s in self.servidores:
                 proceso = s.get("proceso")
