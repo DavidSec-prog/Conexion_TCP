@@ -372,6 +372,8 @@ class ClienteGUI:
 
 
             #Envia siempre los primeros 2 bytes del mensaje// indica la longitud exacta del nombre
+            self.socket.sendall(b'C')
+
             nombre_len_bytes = self.recibir_exacto(2)
             if not nombre_len_bytes or len(nombre_len_bytes) < 2:
                 return False

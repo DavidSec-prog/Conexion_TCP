@@ -395,6 +395,26 @@ class ServidorGUI:
                     continue
                 except OSError:
                     break
+
+                # ===== IDENTIFICAR SI ES CLIENTE REAL O HEALTH CHECK =====
+                # El cliente envía 'C' al conectar. El balanceador envía 'H' en sus pings.
+                # Si no recibimos 'C', no contamos la conexión como cliente.
+                client_socket.settimeout(1.0)
+                try:
+                    primer_byte = client_socket.recv(1)
+                except:
+                    primer_byte = b''
+                client_socket.settimeout(None)
+
+                if primer_byte != b'C':
+                    # No es un cliente real: es el health check del balanceador
+                    # o una conexión vacía. Cerrar sin asignar número.
+                    try:
+                        client_socket.close()
+                    except:
+                        pass
+                    continue  # Vuelve al inicio del while, sin contar
+
                 #Valdiacion y muestra de contador de clientes conectados
                 self.contador_clientes += 1
                 nombre_cliente = f"Cliente {self.contador_clientes}"
